@@ -85,6 +85,12 @@ struct sway_drag {
 	struct sway_seat *seat;
 	struct wlr_drag *wlr_drag;
 	struct wl_listener destroy;
+	struct wl_listener drop;
+
+	// Scrolling the workspace when dragging to the edges of the output
+	struct wl_event_source *edge_scroll_timer;
+	struct sway_workspace *edge_scroll_workspace; // NULL if not scrolling
+	struct timespec edge_scroll_time;
 };
 
 struct sway_seat {
@@ -264,6 +270,10 @@ void seat_idle_notify_activity(struct sway_seat *seat,
 bool seat_is_input_allowed(struct sway_seat *seat, struct wlr_surface *surface);
 
 void drag_icons_update_position(struct sway_seat *seat);
+
+// Stop scrolling the workspace because of a drag to the edge of the output,
+// leaving the layout in a consistent state
+void seat_drag_edge_scroll_stop(struct sway_seat *seat);
 
 enum wlr_edges find_resize_edge(struct sway_container *cont,
 		struct wlr_surface *surface, struct sway_cursor *cursor);

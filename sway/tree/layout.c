@@ -3583,6 +3583,19 @@ bool layout_scroll_end(struct sway_seat *seat) {
 	return true;
 }
 
+void layout_scroll_cancel(struct sway_workspace *workspace) {
+	animation_set_type(ANIMATION_DEFAULT);
+	if (!workspace->gesture.scrolling) {
+		return;
+	}
+	if (workspace->gesture.pin) {
+		layout_scroll_unfloat_pinned_container(workspace);
+	}
+	workspace->gesture.scrolling = false;
+	arrange_workspace(workspace);
+	transaction_commit_dirty();
+}
+
 bool layout_pin_enabled(struct sway_workspace *workspace) {
 	if (!workspace->layout.pin.container) {
 		return false;

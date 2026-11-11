@@ -1,4 +1,5 @@
 #include <assert.h>
+#include <math.h>
 #include <linux/input-event-codes.h>
 #include <string.h>
 #include <strings.h>
@@ -30,6 +31,7 @@
 #include "sway/output.h"
 #include "sway/server.h"
 #include "sway/tree/arrange.h"
+#include "sway/tree/layout.h"
 #include "sway/tree/container.h"
 #include "sway/tree/root.h"
 #include "sway/tree/virtual_output.h"
@@ -388,8 +390,172 @@ void drag_icons_update_position(struct sway_seat *seat) {
 	}
 }
 
+static void find_workspace(struct sway_workspace *workspace, void *data) {
+	struct sway_workspace **search = data;
+	if (search[0] == workspace) {
+		search[1] = workspace;
+	}
+}
+
+static void drag_edge_scroll_stop(struct sway_drag *drag) {
+	struct sway_workspace *workspace = drag->edge_scroll_workspace;
+	if (!workspace) {
+		return;
+	}
+	drag->edge_scroll_workspace = NULL;
+	struct sway_seat *seat = drag->seat;
+	if (seat->workspace == workspace) {
+		layout_scroll_end(seat);
+		return;
+	}
+	// The seat is in a different workspace now, and the one we were
+	// scrolling may not even exist any more.
+	struct sway_workspace *search[2] = { workspace, NULL };
+	root_for_each_workspace(find_workspace, search);
+	if (search[1]) {
+		layout_scroll_cancel(workspace);
+	}
+}
+
+void seat_drag_edge_scroll_stop(struct sway_seat *seat) {
+	struct wlr_drag *wlr_drag = seat->wlr_seat->drag;
+	if (wlr_drag && wlr_drag->data) {
+		drag_edge_scroll_stop(wlr_drag->data);
+	}
+}
+
+// Returns how fast the workspace of the seat should scroll (in pixels per
+// second, positive to move the content to the right) given the position of
+// the cursor.
+static double drag_edge_scroll_get_speed(struct sway_seat *seat) {
+	struct sway_workspace *workspace = seat->workspace;
+	if (!config->drag_edge_scroll || !workspace || workspace->fullscreen ||
+			workspace->tiling->length == 0 ||
+			layout_get_type(workspace) != L_HORIZ) {
+		return 0.0;
+	}
+	struct wlr_cursor *cursor = seat->cursor->cursor;
+	struct wlr_output *wlr_output = wlr_output_layout_output_at(
+		root->output_layout, cursor->x, cursor->y);
+	struct sway_output *output = wlr_output ? wlr_output->data : NULL;
+	if (!output || output_get_active_workspace(output) != workspace) {
+		return 0.0;
+	}
+	struct wlr_box box;
+	wlr_output_layout_get_box(root->output_layout, wlr_output, &box);
+	const double zone = config->drag_edge_scroll_zone;
+	const double left = cursor->x - box.x;
+	const double right = box.x + box.width - 1 - cursor->x;
+	double direction, depth;
+	if (left < zone) {
+		direction = 1.0;
+		depth = 1.0 - left / zone;
+	} else if (right < zone) {
+		direction = -1.0;
+		depth = 1.0 - right / zone;
+	} else {
+		return 0.0;
+	}
+	if (depth > 1.0) {
+		depth = 1.0;
+	}
+	return direction * depth * config->drag_edge_scroll_speed;
+}
+
+// Don't scroll past the first or last containers of the workspace
+static double drag_edge_scroll_clamp(struct sway_workspace *workspace, double dx) {
+	const double scale = layout_scale_enabled(workspace) ? layout_scale_get(workspace) : 1.0;
+	const double gap = scale * workspace->gaps_inner;
+	if (dx > 0.0) {
+		struct sway_container *first = workspace->tiling->items[0];
+		const double room = workspace->x + gap - first->pending.x;
+		return room <= 0.0 ? 0.0 : fmin(dx, room);
+	}
+	struct sway_container *last = workspace->tiling->items[workspace->tiling->length - 1];
+	const double room = last->pending.x + scale * last->pending.width + gap -
+		(workspace->x + workspace->width);
+	return room <= 0.0 ? 0.0 : fmax(dx, -room);
+}
+
+static int drag_edge_scroll_get_interval(struct sway_seat *seat) {
+	struct wlr_cursor *cursor = seat->cursor->cursor;
+	struct wlr_output *wlr_output = wlr_output_layout_output_at(
+		root->output_layout, cursor->x, cursor->y);
+	if (wlr_output && wlr_output->refresh > 0) {
+		int interval = 1000000 / wlr_output->refresh;
+		return interval < 2 ? 2 : interval;
+	}
+	return 16;
+}
+
+static int drag_handle_edge_scroll_timer(void *data) {
+	struct sway_drag *drag = data;
+	struct sway_seat *seat = drag->seat;
+
+	struct timespec now;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	double dt = (now.tv_sec - drag->edge_scroll_time.tv_sec) +
+		(now.tv_nsec - drag->edge_scroll_time.tv_nsec) / 1e9;
+	drag->edge_scroll_time = now;
+	if (dt > 0.1) {
+		dt = 0.1;
+	}
+
+	const double speed = drag_edge_scroll_get_speed(seat);
+	if (drag->edge_scroll_workspace &&
+			(speed == 0.0 || drag->edge_scroll_workspace != seat->workspace)) {
+		drag_edge_scroll_stop(drag);
+	}
+	if (speed != 0.0) {
+		struct sway_workspace *workspace = seat->workspace;
+		// The scale is applied by layout_scroll_update()
+		const double scale = layout_scale_enabled(workspace) ? layout_scale_get(workspace) : 1.0;
+		const double dx = drag_edge_scroll_clamp(workspace, speed * dt * scale) / scale;
+		if (dx != 0.0 && !drag->edge_scroll_workspace &&
+				layout_scroll_begin(seat)) {
+			drag->edge_scroll_workspace = workspace;
+		}
+		if (dx != 0.0 && drag->edge_scroll_workspace) {
+			layout_scroll_update(seat, dx, 0.0, 1.0);
+		}
+	}
+
+	wl_event_source_timer_update(drag->edge_scroll_timer,
+		drag_edge_scroll_get_interval(seat));
+	return 0;
+}
+
+static void drag_handle_drop(struct wl_listener *listener, void *data) {
+	struct sway_drag *drag = wl_container_of(listener, drag, drop);
+	struct sway_seat *seat = drag->seat;
+	if (drag->wlr_drag->grab_type != WLR_DRAG_GRAB_KEYBOARD_POINTER) {
+		return;
+	}
+
+	// Focus the container where the drop happened. Look for it before the
+	// layout settles, that is what the user sees under the cursor.
+	struct wlr_cursor *cursor = seat->cursor->cursor;
+	struct wlr_surface *surface = NULL;
+	double sx, sy;
+	struct sway_node *node = node_at_coords(seat, cursor->x, cursor->y,
+		&surface, &sx, &sy);
+
+	drag_edge_scroll_stop(drag);
+
+	if (node && node->type == N_CONTAINER) {
+		seat_set_focus_container(seat, node->sway_container);
+		transaction_commit_dirty();
+	}
+}
+
 static void drag_handle_destroy(struct wl_listener *listener, void *data) {
 	struct sway_drag *drag = wl_container_of(listener, drag, destroy);
+
+	drag_edge_scroll_stop(drag);
+	if (drag->edge_scroll_timer) {
+		wl_event_source_remove(drag->edge_scroll_timer);
+	}
+	wl_list_remove(&drag->drop.link);
 
 	// Focus enter isn't sent during drag, so refocus the focused node, layer
 	// surface or unmanaged surface.
@@ -454,6 +620,19 @@ static void handle_start_drag(struct wl_listener *listener, void *data) {
 
 	drag->destroy.notify = drag_handle_destroy;
 	wl_signal_add(&wlr_drag->events.destroy, &drag->destroy);
+
+	drag->drop.notify = drag_handle_drop;
+	wl_signal_add(&wlr_drag->events.drop, &drag->drop);
+
+	if (wlr_drag->grab_type == WLR_DRAG_GRAB_KEYBOARD_POINTER) {
+		clock_gettime(CLOCK_MONOTONIC, &drag->edge_scroll_time);
+		drag->edge_scroll_timer = wl_event_loop_add_timer(
+			server.wl_event_loop, drag_handle_edge_scroll_timer, drag);
+		if (drag->edge_scroll_timer) {
+			wl_event_source_timer_update(drag->edge_scroll_timer,
+				drag_edge_scroll_get_interval(seat));
+		}
+	}
 
 	struct wlr_drag_icon *wlr_drag_icon = wlr_drag->icon;
 	if (wlr_drag_icon != NULL) {
