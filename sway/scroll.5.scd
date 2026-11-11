@@ -1544,15 +1544,17 @@ The default colors are:
 
 *drag_edge_scroll* enable|disable|toggle
 	Sets whether or not dragging something (a file, an image, selected text...)
-	to the left or right edge of an output scrolls the workspace in that
-	direction, so you can drop it on a window that was outside of the viewport.
-	The speed depends on how close to the edge the cursor is. The window where
-	you drop gets the focus. It only applies to workspaces with a horizontal
-	layout. The default is _enable_. _toggle_ should not be used in the config
-	file.
+	to the edges of an output scrolls its workspace, so you can drop on a
+	window that was outside of the viewport. Workspaces with a horizontal
+	layout scroll at the left and right edges of the output, and those with a
+	vertical layout at the top and bottom edges. Scrolling starts after the
+	cursor stays at the edge for a moment, its speed depends on how close to
+	the edge the cursor is, and it stops at the first or last container. When
+	enabled, the window where you drop gets the focus. The default is
+	_disable_. _toggle_ should not be used in the config file.
 
 *drag_edge_scroll* zone <pixels>
-	Sets the width of the area at each edge of the output that triggers
+	Sets the size of the area at each edge of the output that triggers
 	*drag_edge_scroll*. The default is _48_.
 
 *drag_edge_scroll* speed <pixels per second>

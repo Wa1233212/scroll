@@ -299,11 +299,6 @@ list_t *execute_command(char *_exec, struct sway_seat *seat,
 
 	config->handler_context.seat = seat;
 
-	// A command may switch workspaces or change the layout, finish any
-	// scrolling started by dragging to the edge of the output first. It
-	// will start again if the cursor is still there.
-	seat_drag_edge_scroll_stop(seat);
-
 	do {
 		for (; isspace(*head); ++head) {}
 		// Extract criteria (valid for this command list only).
